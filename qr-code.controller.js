@@ -2,46 +2,47 @@
  * qr-code.controller.js
  *
  * Handles:
- *   POST /api/create-qr   — TV requests a new QR session
- *   POST /api/pair-qr     — Mobile scans QR and pairs
- *   GET  /api/polling/:id — TV polls until session is paired
+ *   POST /api/create-qr        — TV requests a new (or existing) QR session
+ *   POST /api/pair-qr          — Mobile scans QR and pairs
+ *   GET  /api/polling/:id      — TV long-polls until session is paired
+ *   GET  /api/session/:id      — Lightweight session status check
+ *   DELETE /api/session/:id    — Explicit logout / session deletion
+ *
+ * ─── No pairToken ────────────────────────────────────────────────────────────
+ * The previous version issued a pairToken on pairing and required it for
+ * mobile reconnects. This version removes it entirely.
+ *
+ * Both TV and mobile reconnect with just sessionId:
+ *   ws://host/ws?role=tv&sessionId=<id>
+ *   ws://host/ws?role=mobile&sessionId=<id>
+ *
+ * Sessions never expire from inactivity — only explicit DELETE removes them.
  */
 
 const QRCode = require('qrcode');
-const store = require('./session.store');
+const store  = require('./session.store');
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 
-// Base URL embedded in the QR code (mobile deep-link or web URL)
-const QR_BASE_URL = process.env.QR_BASE_URL || 'https://yourapp.com/pair';
+const QR_BASE_URL        = process.env.QR_BASE_URL || 'https://yourapp.com/pair';
+const LONG_POLL_TIMEOUT  = 20_000; // ms — max wait per long-poll request
+const POLL_INTERVAL      = 500;    // ms — check interval inside long-poll
 
-// Polling: max wait per long-poll request (ms)
-const LONG_POLL_TIMEOUT = 20_000;
-
-// Polling: interval between status checks inside long-poll (ms)
-const POLL_INTERVAL = 500;
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Wait for a session to reach 'paired' status (long-poll helper).
- * Resolves with the session or null on timeout.
+ * Long-poll: wait until session.status !== 'pending', or timeout.
+ * Uses getOrCreateSession so it never returns null.
  */
 function waitForPairing(sessionId, timeoutMs) {
   return new Promise((resolve) => {
     const deadline = Date.now() + timeoutMs;
 
     const tick = () => {
-      const session = store.getSession(sessionId);
+      const session = store.getOrCreateSession(sessionId);
 
-      // Session expired or deleted
-      if (!session) return resolve(null);
-
-      // Paired → resolve immediately
-      if (session.status !== 'pending') return resolve(session);
-
-      // Timed out
-      if (Date.now() >= deadline) return resolve(session);
+      if (session.status !== 'pending') return resolve(session); // paired ✓
+      if (Date.now() >= deadline)       return resolve(session); // timeout (still pending)
 
       setTimeout(tick, POLL_INTERVAL);
     };
@@ -50,45 +51,57 @@ function waitForPairing(sessionId, timeoutMs) {
   });
 }
 
-// ─── Controllers ─────────────────────────────────────────────────────────────
+// ─── Controllers ──────────────────────────────────────────────────────────────
 
 /**
  * POST /api/create-qr
  *
- * Called by the TV when it needs to display a QR code.
- * Returns a base64 PNG QR image + the session ID for polling.
+ * TV calls this on startup (or when showing the QR screen).
  *
- * Body (optional): { meta: { deviceName: "Living Room TV" } }
+ * If the TV already has a sessionId in storage, pass it in the body so the
+ * same session is reused — no new QR needed. If not, a new one is created.
+ *
+ * Body (optional): { sessionId?: string, meta?: object }
  *
  * Response:
  * {
- *   sessionId: string,
- *   qrDataUrl:  string,   ← base64 PNG for <img src="...">
- *   expiresIn:  number,   ← seconds until session expires
+ *   success:   true,
+ *   sessionId: string,   ← TV must persist this in AsyncStorage as 'roomId'
+ *   qrDataUrl: string,   ← base64 PNG for <img src="...">
+ *   pairingUrl: string,  ← URL embedded in QR (for debug / manual entry)
+ *   status:    string,   ← 'pending' | 'paired' | 'connected' | 'disconnected'
  * }
+ *
+ * CHANGED: removed pairToken from response. Added sessionId pass-through so
+ * TV can reuse existing session after server restart instead of generating new QR.
  */
 async function createQr(req, res) {
   try {
-    const meta = req.body?.meta || {};
-    const session = store.createSession(meta);
+    const { sessionId: existingId, meta = {} } = req.body || {};
 
-    // Build the URL mobile will open after scanning
+    // If TV supplies its stored sessionId, reuse that session (or recreate it
+    // transparently if the server was restarted and lost it).
+    // If TV has no stored sessionId, create a brand new session.
+    const session = existingId
+      ? store.getOrCreateSession(existingId, meta) // reuse / restore
+      : store.createSession(null, meta);           // brand new
+
     const pairingUrl = `${QR_BASE_URL}?sessionId=${session.id}`;
 
-    // Generate QR as base64 data URL (TV renders this as <img>)
+    // QR encodes only the sessionId — mobile sends this to /api/pair-qr
     const qrDataUrl = await QRCode.toDataURL(session.id, {
       errorCorrectionLevel: 'H',
       margin: 2,
-      width: 300,
-      color: { dark: '#000000', light: '#ffffff' },
+      width:  300,
+      color:  { dark: '#000000', light: '#ffffff' },
     });
 
     return res.status(201).json({
-      success: true,
-      sessionId: session.id,
+      success:    true,
+      sessionId:  session.id,   // ← TV stores this as 'roomId' in AsyncStorage
       qrDataUrl,
-      pairingUrl,          // handy for debugging / manual entry
-      expiresIn: 86400,    // 24 hours
+      pairingUrl,
+      status:     session.status,
     });
   } catch (err) {
     console.error('[createQr] error:', err);
@@ -99,50 +112,54 @@ async function createQr(req, res) {
 /**
  * POST /api/pair-qr
  *
- * Called by the mobile after scanning the QR code.
- * Marks the session as paired and returns a pairToken for future reconnects.
+ * Mobile calls this after scanning the QR code.
+ * Marks the session as paired so the TV's poll resolves.
  *
- * Body: { sessionId: string, meta?: { deviceName, platform, ... } }
+ * Body: { sessionId: string, meta?: object }
  *
  * Response:
  * {
- *   pairToken: string,   ← store this in mobile; used for WS reconnect auth
- *   sessionId: string,
+ *   success:   true,
+ *   sessionId: string,   ← mobile stores this in AsyncStorage as 'roomId'
+ *   status:    string,
  * }
+ *
+ * CHANGED:
+ *  - Removed pairToken from response entirely
+ *  - Uses getOrCreateSession instead of getSession — never returns 404
+ *  - If already paired, still returns success (idempotent) so mobile can
+ *    safely call this again on re-scan without breaking anything
  */
 async function pairQr(req, res) {
   try {
-    const { sessionId, meta = {} } = req.body;
+    const { sessionId, meta = {} } = req.body || {};
 
     if (!sessionId) {
       return res.status(400).json({ success: false, message: 'sessionId is required' });
     }
 
-    const existing = store.getSession(sessionId);
-    if (!existing) {
-      return res.status(404).json({ success: false, message: 'Session not found or expired' });
-    }
+    // getOrCreateSession: never returns null — recreates if missing
+    const session = store.getOrCreateSession(sessionId, meta);
 
-    if (existing.status !== 'pending') {
-      return res.status(409).json({
-        success: false,
-        message: 'Session already paired',
-        // Still return token so mobile can reconnect if it lost its copy
-        pairToken: existing.pairToken,
-        sessionId: existing.id,
+    if (session.status !== 'pending') {
+      // Already paired — idempotent success
+      // Mobile may call this again if it lost its state; just confirm the session
+      return res.status(200).json({
+        success:   true,
+        sessionId: session.id,
+        status:    session.status,
+        message:   'Session already paired. Connect WebSocket now.',
       });
     }
 
-    const session = store.pairSession(sessionId, meta);
-    if (!session) {
-      return res.status(500).json({ success: false, message: 'Pairing failed' });
-    }
+    // Mark as paired — no token issued
+    const paired = store.pairSession(session.id);
 
     return res.status(200).json({
-      success: true,
-      sessionId: session.id,
-      pairToken: session.pairToken,   // ← mobile MUST persist this
-      message: 'Pairing successful. Connect WebSocket now.',
+      success:   true,
+      sessionId: paired.id,   // ← mobile stores this as 'roomId' in AsyncStorage
+      status:    paired.status,
+      message:   'Pairing successful. Connect WebSocket now.',
     });
   } catch (err) {
     console.error('[pairQr] error:', err);
@@ -153,14 +170,19 @@ async function pairQr(req, res) {
 /**
  * GET /api/polling/:sessionId
  *
- * Long-poll endpoint for the TV.
- * Hangs until the session is paired (or times out after ~20 s).
- * TV keeps calling this until status !== 'pending'.
+ * Long-poll for TV. Hangs until session.status !== 'pending' or ~20s timeout.
+ * TV calls this in a loop after showing the QR until it sees status = 'paired'.
+ *
+ * CHANGED: uses getOrCreateSession internally so it never returns 404.
+ * Even if the server restarted mid-poll, the session is recreated and TV
+ * continues polling normally.
  *
  * Response:
  * {
- *   status: 'pending' | 'paired' | 'connected' | 'disconnected',
+ *   success:   true,
  *   sessionId: string,
+ *   status:    'pending' | 'paired' | 'connected' | 'disconnected',
+ *   pairedAt:  number | null,
  * }
  */
 async function pollSession(req, res) {
@@ -173,15 +195,11 @@ async function pollSession(req, res) {
 
     const session = await waitForPairing(sessionId, LONG_POLL_TIMEOUT);
 
-    if (!session) {
-      return res.status(404).json({ success: false, message: 'Session not found or expired' });
-    }
-
     return res.status(200).json({
-      success: true,
+      success:   true,
       sessionId: session.id,
-      status: session.status,
-      pairedAt: session.pairedAt,
+      status:    session.status,
+      pairedAt:  session.pairedAt,
     });
   } catch (err) {
     console.error('[pollSession] error:', err);
@@ -192,23 +210,37 @@ async function pollSession(req, res) {
 /**
  * GET /api/session/:sessionId
  *
- * Lightweight status check (no long-poll) — used after WS reconnect
- * to confirm session is still alive.
+ * Lightweight status check — no long-poll.
+ * Used by TV/mobile after a WS reconnect to confirm session is still valid.
+ *
+ * CHANGED: uses getOrCreateSession — never returns 404.
+ * If the session was lost (server restart), it is recreated and the client
+ * knows to reconnect its WS.
+ *
+ * Response:
+ * {
+ *   success:  true,
+ *   sessionId: string,
+ *   status:   string,
+ *   pairedAt: number | null,
+ * }
  */
 async function getSessionStatus(req, res) {
   try {
     const { sessionId } = req.params;
-    const session = store.getSession(sessionId);
 
-    if (!session) {
-      return res.status(404).json({ success: false, message: 'Session not found or expired' });
+    if (!sessionId) {
+      return res.status(400).json({ success: false, message: 'sessionId is required' });
     }
 
+    // getOrCreateSession: if session was wiped, recreate it so client can reconnect
+    const session = store.getOrCreateSession(sessionId);
+
     return res.status(200).json({
-      success: true,
+      success:   true,
       sessionId: session.id,
-      status: session.status,
-      pairedAt: session.pairedAt,
+      status:    session.status,
+      pairedAt:  session.pairedAt,
     });
   } catch (err) {
     console.error('[getSessionStatus] error:', err);
@@ -216,4 +248,39 @@ async function getSessionStatus(req, res) {
   }
 }
 
-module.exports = { createQr, pairQr, pollSession, getSessionStatus };
+/**
+ * DELETE /api/session/:sessionId
+ *
+ * Explicit logout. The ONLY way a session is permanently deleted.
+ * Call this when the user logs out from TV or mobile.
+ * After this, clients must re-scan QR to create a new session.
+ *
+ * ADDED: was missing in previous version — there was no logout endpoint.
+ */
+async function deleteSessionHandler(req, res) {
+  try {
+    const { sessionId } = req.params;
+
+    if (!sessionId) {
+      return res.status(400).json({ success: false, message: 'sessionId is required' });
+    }
+
+    store.deleteSession(sessionId);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Session deleted. Re-scan QR to reconnect.',
+    });
+  } catch (err) {
+    console.error('[deleteSession] error:', err);
+    return res.status(500).json({ success: false, message: 'Error deleting session' });
+  }
+}
+
+module.exports = {
+  createQr,
+  pairQr,
+  pollSession,
+  getSessionStatus,
+  deleteSessionHandler,
+};
