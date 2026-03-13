@@ -147,12 +147,12 @@ function deleteSession(id) {
 
 // ─── Periodic cleanup of expired sessions ───────────────────────────────────
 
-setInterval(() => {
-  const cutoff = now() - SESSION_TTL;
-  for (const [id, session] of sessions.entries()) {
-    if (session.createdAt < cutoff) sessions.delete(id);
-  }
-}, 10 * 60 * 1000); // every 10 minutes
+// setInterval(() => {
+//   const cutoff = now() - SESSION_TTL;
+//   for (const [id, session] of sessions.entries()) {
+//     if (session.createdAt < cutoff) sessions.delete(id);
+//   }
+// }, 10 * 60 * 1000); // every 10 minutes
 
 module.exports = {
   createSession,
