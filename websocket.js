@@ -3,43 +3,56 @@
  *
  * Persistent WebSocket server for TV ↔ Mobile communication.
  *
- * Connection auth (query params on ws:// URL):
+ * ─── Connection URLs ──────────────────────────────────────────────────────────
  *   TV:     ws://host/ws?role=tv&sessionId=<id>
- *   Mobile: ws://host/ws?role=mobile&sessionId=<id>&pairToken=<token>
+ *   Mobile: ws://host/ws?role=mobile&sessionId=<id>
  *
- * Message format is aligned with the React Native frontend expectations:
+ * ─── Message contract (Mobile → Server → TV) ─────────────────────────────────
  *
- *   connected   → { type: 'connected',   connection_type, connection_count }
- *   disconnect  → { type: 'disconnect',  connection_type }
- *   message     → { type: 'message',     data: <payload from sender> }
- *   error       → { type: 'error',       code, message }
- *   pong        → { type: 'pong',        ts }
+ *  Mobile SENDS:
+ *    { type: 'message', data: { type: 'artWork' | 'collectionQueue' | 'aiMagic' | ..., payload: {...} } }
+ *
+ *  TV RECEIVES (server forwards data.data transparently):
+ *    { type: 'message', data: { type: 'artWork', payload: {...} } }
+ *
+ *  TV reads it as:
+ *    message.data.data.type    → 'artWork'
+ *    message.data.data.payload → { image, title, ... }
+ *
+ * ─── Server → Client events ──────────────────────────────────────────────────
+ *   connected   → { type: 'connected',  connection_type: 'tv'|'mobile', connection_count: number, sessionId }
+ *   disconnect  → { type: 'disconnect', connection_type: 'tv'|'mobile', sessionId, message }
+ *   message     → { type: 'message',    data: { type, payload } }
+ *   error       → { type: 'error',      code, message }
+ *   pong        → { type: 'pong',       ts }
+ *
+ * ─── rituals_collection shortcut ─────────────────────────────────────────────
+ *   Mobile can also send:
+ *     { type: 'rituals_collection', payload: [...] }
+ *   Server forwards to TV as-is (TV handles it at top of processWebSocketMessage).
  */
 
 const { WebSocketServer, WebSocket } = require('ws');
-const url = require('url');
+const url   = require('url');
 const store = require('./session.store');
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 
-const HEARTBEAT_INTERVAL = 25_000; // send ping every 25 s
-const HEARTBEAT_TIMEOUT  = 10_000; // close if pong not received within 10 s
+const HEARTBEAT_INTERVAL = 25_000; // ping every 25 s
 
 // ─── Message type constants ───────────────────────────────────────────────────
 
 const MSG = {
-  // Server → Client  (names match what the RN frontend listens for)
-  CONNECTED:  'connected',   // auth succeeded / peer joined
-  DISCONNECT: 'disconnect',  // peer disconnected  ← was 'peer_left'
-  ERROR:      'error',       // auth or runtime error
-  PONG:       'pong',        // heartbeat reply
-
-  // Client → Server
-  PING:    'ping',    // heartbeat from client
-  MESSAGE: 'message', // arbitrary relay message
+  CONNECTED:          'connected',           // auth confirmed + peer-join notification
+  DISCONNECT:         'disconnect',          // peer left  (was wrongly 'peer_left' before)
+  MESSAGE:            'message',             // relayed payload
+  RITUALS_COLLECTION: 'rituals_collection',  // ritual shortcut relay
+  ERROR:              'error',
+  PING:               'ping',
+  PONG:               'pong',
 };
 
-// ─── Internal socket registry ─────────────────────────────────────────────────
+// ─── Socket registry ──────────────────────────────────────────────────────────
 
 let _socketCounter = 0;
 const socketMap = new Map(); // socketId → { ws, sessionId, role }
@@ -58,7 +71,10 @@ function unregisterSocket(socketId) {
   socketMap.delete(socketId);
 }
 
-/** Return all open sockets belonging to a session (optionally filtered by role). */
+/**
+ * Return all OPEN sockets for a session.
+ * Pass role = 'tv' | 'mobile' to filter, or null for all.
+ */
 function getSessionSockets(sessionId, role = null) {
   const results = [];
   for (const entry of socketMap.values()) {
@@ -73,23 +89,23 @@ function getSessionSockets(sessionId, role = null) {
   return results;
 }
 
-/** Return the first open peer socket (opposite role) for a session. */
+/** First open peer socket (opposite role). */
 function getPeerSocket(sessionId, ownRole) {
   const peerRole = ownRole === 'tv' ? 'mobile' : 'tv';
-  const peers = getSessionSockets(sessionId, peerRole);
+  const peers    = getSessionSockets(sessionId, peerRole);
   return peers.length ? peers[0].ws : null;
 }
 
-/** Count all open sockets in a session. */
+/** Total open sockets in a session (TV + Mobile combined). */
 function getConnectionCount(sessionId) {
   return getSessionSockets(sessionId).length;
 }
 
 // ─── Send helpers ─────────────────────────────────────────────────────────────
 
-function send(ws, type, payload = {}) {
+function send(ws, type, extra = {}) {
   if (ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ type, ...payload }));
+  ws.send(JSON.stringify({ type, ...extra }));
 }
 
 function sendError(ws, message, code = 'ERROR') {
@@ -118,10 +134,12 @@ function authenticate(query, ws) {
     return null;
   }
 
+  // TV only needs a valid sessionId (it created the session)
   if (role === 'tv') {
     return { session, role };
   }
 
+  // Mobile requires a paired session
   if (session.status === 'pending') {
     sendError(ws, 'Session not yet paired', 'NOT_PAIRED');
     return null;
@@ -136,11 +154,12 @@ function startHeartbeat(wss) {
   const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (!ws._isAlive) {
+        console.log(`[WS] Terminating unresponsive socket: ${ws._socketId}`);
         ws.terminate();
         return;
       }
       ws._isAlive = false;
-      ws.ping(); // native WS ping frame
+      ws.ping(); // native WebSocket ping frame — triggers 'pong' event on client
     });
   }, HEARTBEAT_INTERVAL);
 
@@ -152,116 +171,141 @@ function startHeartbeat(wss) {
 function onConnection(ws, req) {
   const query = url.parse(req.url, true).query;
 
-  // ── Auth ──────────────────────────────────────────────────────────────────
+  // ── 1. Authenticate ───────────────────────────────────────────────────────
   const auth = authenticate(query, ws);
-  if (!auth) return;
+  if (!auth) return; // sendError already closed the socket
 
   const { session, role } = auth;
 
-  // Register the socket BEFORE counting so this socket is included in the count
+  // ── 2. Register socket ────────────────────────────────────────────────────
+  // Register BEFORE counting so this socket is included in the total.
   const socketId = registerSocket(ws, session.id, role);
   store.updateSessionSocket(session.id, role, socketId);
 
-  const connectionCount = getConnectionCount(session.id); // includes self
+  const connectionCount = getConnectionCount(session.id);
 
-  // ── Confirm connection to THIS client ─────────────────────────────────────
+  // ── 3. Confirm connection to THIS client ──────────────────────────────────
   //
-  // Frontend reads:
-  //   data.type === 'connected'
-  //   data.connection_type  → 'tv' | 'mobile'
-  //   data.connection_count → total devices in session (>1 means peer is online)
+  // Frontend (TV) reads:
+  //   data.type              → 'connected'
+  //   data.connection_type   → own role ('tv' | 'mobile')
+  //   data.connection_count  → total devices in session right now
   //
   send(ws, MSG.CONNECTED, {
     connection_type:  role,
     connection_count: connectionCount,
-    sessionId: session.id,
+    sessionId:        session.id,
   });
 
-  // ── Notify peer that a new device joined ──────────────────────────────────
+  // ── 4. Notify peer that this device joined ────────────────────────────────
   //
-  // The peer also receives a 'connected' event so it can update isMobileConnected.
-  // connection_type is the role of the device that JUST joined (not the receiver's role).
+  // Peer also receives a 'connected' event so it can update isMobileConnected.
+  //   data.connection_type = the role that JUST joined (not the receiver's role)
   //
   const peer = getPeerSocket(session.id, role);
   if (peer) {
-    const updatedCount = getConnectionCount(session.id); // still the same value
     send(peer, MSG.CONNECTED, {
-      connection_type:  role,          // the role that just joined
-      connection_count: updatedCount,
-      sessionId: session.id,
+      connection_type:  role,            // who just joined
+      connection_count: connectionCount,
+      sessionId:        session.id,
     });
   }
 
   console.log(
-    `[WS] ${role} connected | session=${session.id} | socket=${socketId} | devices=${connectionCount}`
+    `[WS] ${role} connected | session=${session.id} | socket=${socketId} | total=${connectionCount}`
   );
 
-  // ── Pong handler (native ping frame response) ─────────────────────────────
+  // ── 5. Native pong (response to server's ws.ping()) ───────────────────────
   ws.on('pong', () => {
     ws._isAlive = true;
   });
 
-  // ── Message handler ───────────────────────────────────────────────────────
+  // ── 6. Message handler ────────────────────────────────────────────────────
   ws.on('message', (raw) => {
     let data;
     try {
       data = JSON.parse(raw);
     } catch {
-      send(ws, MSG.ERROR, { code: 'INVALID_JSON', message: 'Message must be JSON' });
+      send(ws, MSG.ERROR, { code: 'INVALID_JSON', message: 'Message must be valid JSON' });
       return;
     }
 
-    // Application-level ping → pong
+    // ── 6a. Application-level ping → pong ─────────────────────────────────
     if (data.type === MSG.PING) {
       ws._isAlive = true;
       send(ws, MSG.PONG, { ts: Date.now() });
       return;
     }
 
-    // ── Relay message to peer ──────────────────────────────────────────────
+    // ── 6b. Main relay ─────────────────────────────────────────────────────
     //
-    // Frontend (TV side) reads relayed messages as:
-    //   message.data?.data?.type  (e.g. 'collectionQueue', 'aiMagic', 'artWork' …)
-    //   message.data?.data?.payload
+    // Mobile sends:
+    //   {
+    //     type: 'message',
+    //     data: {                    ← key is 'data', NOT 'payload'
+    //       type: 'artWork',
+    //       payload: { image, title, glowInnerColors, ... }
+    //     }
+    //   }
     //
-    // So the TV must receive:  { type: 'message', data: <what mobile sent as payload> }
+    // Server forwards data.data (the inner object) under the key 'data':
+    //   { type: 'message', data: { type: 'artWork', payload: {...} } }
     //
-    // Mobile should send:
-    //   { type: 'message', payload: { data: { type: 'collectionQueue', payload: {...} } } }
-    //            ↑ outer type for server routing    ↑ this becomes message.data on TV
+    // TV frontend then reads:
+    //   message.data?.data?.type     → 'artWork'       ✓
+    //   message.data?.data?.payload  → { image, ... }  ✓
+    //
+    // Same structure works for ALL feature types:
+    //   'collectionQueue', 'aiMagic', 'artWork', 'reconnect', etc.
     //
     if (data.type === MSG.MESSAGE) {
       const peerWs = getPeerSocket(session.id, role);
       if (peerWs) {
-        // Wrap payload under `data` so TV frontend can read message.data.data.type
-        send(peerWs, MSG.MESSAGE, { data: data.payload ?? null });
+        send(peerWs, MSG.MESSAGE, {
+          data: data.data ?? null,   // ← CRITICAL: forward data.data, not data.payload
+        });
       } else {
         send(ws, MSG.ERROR, { code: 'PEER_OFFLINE', message: 'Peer is not connected' });
       }
       return;
     }
 
-    // ── rituals_collection shortcut ────────────────────────────────────────
+    // ── 6c. rituals_collection shortcut ───────────────────────────────────
     //
-    // Mobile can send top-level ritual updates directly:
+    // Mobile can push ritual schedules without the 'message' wrapper:
     //   { type: 'rituals_collection', payload: [...] }
-    // The server forwards them to TV in the same shape (frontend handles this at
-    // the top of processWebSocketMessage before it reaches processIndividualMessage).
     //
-    if (data.type === 'rituals_collection' && Array.isArray(data.payload)) {
+    // TV frontend handles this at the TOP of processWebSocketMessage:
+    //   if (data.type === 'rituals_collection' && Array.isArray(data.payload))
+    //
+    if (data.type === MSG.RITUALS_COLLECTION && Array.isArray(data.payload)) {
       const peerWs = getPeerSocket(session.id, role);
       if (peerWs) {
-        send(peerWs, 'rituals_collection', { payload: data.payload });
+        send(peerWs, MSG.RITUALS_COLLECTION, { payload: data.payload });
       }
       return;
     }
 
-    // Unknown message types — log and ignore
-    console.warn(`[WS] Unknown message type "${data.type}" from ${role} | session=${session.id}`);
+    // ── 6d. Reconnect signal ──────────────────────────────────────────────
+    //
+    // TV sends { type: 'reconnected' } after its WS reconnects.
+    // Forward to mobile so it knows TV is back online.
+    //
+    if (data.type === 'reconnected') {
+      const peerWs = getPeerSocket(session.id, role);
+      if (peerWs) {
+        send(peerWs, 'reconnected', { role, sessionId: session.id });
+      }
+      return;
+    }
+
+    console.warn(
+      `[WS] Unhandled message type "${data.type}" from ${role} | session=${session.id}`
+    );
   });
 
-  // ── Disconnect handler ────────────────────────────────────────────────────
-  ws.on('close', (code, reason) => {
+  // ── 7. Disconnect handler ─────────────────────────────────────────────────
+  ws.on('close', (code) => {
     console.log(
       `[WS] ${role} disconnected | session=${session.id} | socket=${socketId} | code=${code}`
     );
@@ -269,24 +313,26 @@ function onConnection(ws, req) {
     unregisterSocket(socketId);
     store.clearSessionSocket(session.id, role);
 
-    // Notify peer with 'disconnect' (what the RN frontend listens for)
+    // Tell peer with 'disconnect' event (what the RN frontend listens for).
     //
     // Frontend reads:
-    //   data.type === 'disconnect'
-    //   data.connection_type → role of the device that left
+    //   data.type            → 'disconnect'
+    //   data.connection_type → 'mobile' | 'tv'  (who left)
     //
     const peerWs = getPeerSocket(session.id, role);
     if (peerWs) {
       send(peerWs, MSG.DISCONNECT, {
-        connection_type: role,           // role that just left
-        sessionId: session.id,
-        message: 'Peer disconnected. It may reconnect shortly.',
+        connection_type: role,
+        sessionId:       session.id,
+        message:         'Peer disconnected. It may reconnect shortly.',
       });
     }
   });
 
   ws.on('error', (err) => {
-    console.error(`[WS] error | session=${session.id} | socket=${socketId}:`, err.message);
+    console.error(
+      `[WS] Socket error | session=${session.id} | socket=${socketId} | ${err.message}`
+    );
   });
 }
 
@@ -296,24 +342,26 @@ function onConnection(ws, req) {
  * Attach a WebSocket server to an existing HTTP/HTTPS server.
  *
  * Usage:
- *   const { createServer } = require('http');
- *   const app = require('./app');
+ *   const http = require('http');
+ *   const app  = require('./app');
  *   const attachWebSocket = require('./websocket');
  *
- *   const httpServer = createServer(app);
- *   attachWebSocket(httpServer);
- *   httpServer.listen(3000);
+ *   const server = http.createServer(app);
+ *   attachWebSocket(server);
+ *   server.listen(3000);
  */
 function attachWebSocket(httpServer) {
   const wss = new WebSocketServer({
     server: httpServer,
-    path: '/ws',
+    path:   '/ws',
   });
 
   startHeartbeat(wss);
+
   wss.on('connection', onConnection);
+
   wss.on('error', (err) => {
-    console.error('[WSS] server error:', err.message);
+    console.error('[WSS] Server error:', err.message);
   });
 
   console.log('[WSS] WebSocket server attached at /ws');
