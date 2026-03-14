@@ -28,4 +28,7 @@ router.get('/polling/:sessionId', ctrl.pollSession);
 // Params: :sessionId
 router.get('/session/:sessionId', ctrl.getSessionStatus);
 
+router.delete('/logout/session/:sessionId', ctrl.deleteSessionHandler);
+
+
 module.exports = router;
