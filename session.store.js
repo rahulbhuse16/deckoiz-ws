@@ -197,6 +197,9 @@ function updateSessionSocket(id, role, socketId) {
 
   if (session.tvSocketId && session.mobileSocketId) {
     session.status = 'connected';
+    if (!session.pairedAt) {
+      session.pairedAt = Date.now(); // 👈 always set once
+    }
   }
 
   _touch(session);
