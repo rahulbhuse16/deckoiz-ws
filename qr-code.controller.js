@@ -240,7 +240,7 @@ async function getSessionStatus(req, res) {
       success:   true,
       sessionId: session.id,
       status:    session.status,
-      pairedAt:  session.pairedAt,
+      pairedAt:  session.lastSeenAt,
     });
   } catch (err) {
     console.error('[getSessionStatus] error:', err);
