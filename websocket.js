@@ -3,33 +3,17 @@
  *
  * Persistent WebSocket server for TV ↔ Mobile communication.
  *
- * ─── Connection URLs ──────────────────────────────────────────────────────────
- *   TV:     ws://host/ws?role=tv&sessionId=<id>
- *   Mobile: ws://host/ws?role=mobile&sessionId=<id>
+ * ─── KEY FIX: React Native does NOT respond to native ws.ping() frames ─────
+ *   The ws library's built-in heartbeat sends native WebSocket ping frames
+ *   and calls ws.terminate() if no native pong comes back. React Native's
+ *   WebSocket implementation silently drops native ping frames — it never
+ *   sends a native pong. Result: every RN client gets terminated after
+ *   one heartbeat cycle with code 1006.
  *
- * ─── KEY FIX: React Native heartbeat compatibility ────────────────────────────
- *   React Native's WebSocket does NOT respond to native ws.ping() frames.
- *   The old code used ONLY native pings, so every React Native client was
- *   terminated after 2 heartbeat cycles (50 s) with code 1006.
- *
- *   Fix: set ws._isAlive = true on ANY received message, not only on native
- *   pong events. The mobile client sends { type: 'ping' } at the application
- *   level every 20 s — this now keeps the server heartbeat satisfied.
- *
- * ─── Message contract (Mobile → Server → TV) ─────────────────────────────────
- *
- *   Mobile SENDS:
- *     { type: 'message', data: { type: 'artWork'|'collectionQueue'|..., payload: {...} } }
- *
- *   TV RECEIVES:
- *     { type: 'message', data: { type: 'artWork', payload: {...} } }
- *
- * ─── Server → Client events ──────────────────────────────────────────────────
- *   connected   → { type: 'connected',  connection_type, connection_count, sessionId }
- *   disconnect  → { type: 'disconnect', connection_type, sessionId, message }
- *   message     → { type: 'message',    data: { type, payload } }
- *   pong        → { type: 'pong',       ts }
- *   error       → { type: 'error',      code, message }
+ *   Solution: remove native ws.ping() entirely. Instead, track the timestamp
+ *   of the last received message on each socket. If no message arrives within
+ *   SOCKET_TIMEOUT, close gracefully with ws.close() (not ws.terminate()).
+ *   The mobile client sends { type: 'ping' } every 20 s, which is enough.
  */
 
 const { WebSocketServer, WebSocket } = require('ws');
@@ -38,10 +22,10 @@ const store = require('./session.store');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-// Native ping/pong cycle. This guards TCP connections that are truly dead
-// (e.g. phone goes offline hard). We keep it generous because React Native
-// clients supplement with app-level pings (see onmessage handler).
-const HEARTBEAT_INTERVAL = 40_000; // ms — increased from 25 s
+const HEARTBEAT_CHECK_INTERVAL = 20_000;  // how often we scan sockets (ms)
+const SOCKET_TIMEOUT           = 70_000;  // evict if silent for this long (ms)
+                                           // mobile pings every 20 s →
+                                           // 70 s = 3 missed pings before eviction
 
 // ─── Message type constants ───────────────────────────────────────────────────
 
@@ -58,14 +42,14 @@ const MSG = {
 // ─── Socket registry ──────────────────────────────────────────────────────────
 
 let _socketCounter = 0;
-const socketMap    = new Map(); // socketId → { ws, sessionId, role }
+const socketMap    = new Map();
 
 function registerSocket(ws, sessionId, role) {
-  const socketId    = `${role}-${++_socketCounter}`;
-  ws._socketId      = socketId;
-  ws._sessionId     = sessionId;
-  ws._role          = role;
-  ws._isAlive       = true;
+  const socketId      = `${role}-${++_socketCounter}`;
+  ws._socketId        = socketId;
+  ws._sessionId       = sessionId;
+  ws._role            = role;
+  ws._lastMessageAt   = Date.now();
   socketMap.set(socketId, { ws, sessionId, role });
   return socketId;
 }
@@ -125,25 +109,36 @@ function authenticate(query, ws) {
     return null;
   }
 
-  // getOrCreateSession: never returns null — recreates transparently if needed
   const session = store.getOrCreateSession(sessionId);
   return { session, role };
 }
 
-// ─── Heartbeat ────────────────────────────────────────────────────────────────
-
+// ─── Heartbeat (timestamp-based — NO native ws.ping()) ───────────────────────
+//
+// React Native WebSocket does NOT reply to native WS ping frames, so using
+// ws.ping() + ws.terminate() on missed pong will always kill RN clients.
+//
+// Instead: every HEARTBEAT_CHECK_INTERVAL ms, iterate all open sockets and
+// check how long since the last message. Exceeds SOCKET_TIMEOUT → close
+// gracefully with ws.close() so the client receives a proper close frame
+// (code 1001) and can reconnect cleanly — not the abrupt terminate() that
+// produces code 1006.
+//
 function startHeartbeat(wss) {
   const interval = setInterval(() => {
+    const now = Date.now();
     wss.clients.forEach((ws) => {
-      if (!ws._isAlive) {
-        console.log(`[WS] Terminating unresponsive socket: ${ws._socketId}`);
-        ws.terminate();
-        return;
+      if (ws.readyState !== WebSocket.OPEN) return;
+
+      const silentMs = now - (ws._lastMessageAt || now);
+      if (silentMs > SOCKET_TIMEOUT) {
+        console.log(
+          `[WS] No message from ${ws._socketId} for ${Math.round(silentMs / 1000)}s — closing`
+        );
+        ws.close(1001, 'heartbeat timeout');
       }
-      ws._isAlive = false;
-      ws.ping(); // native WS ping frame
     });
-  }, HEARTBEAT_INTERVAL);
+  }, HEARTBEAT_CHECK_INTERVAL);
 
   wss.on('close', () => clearInterval(interval));
 }
@@ -153,32 +148,27 @@ function startHeartbeat(wss) {
 function onConnection(ws, req) {
   const query = url.parse(req.url, true).query;
 
-  // ── 1. Auth ───────────────────────────────────────────────────────────────
   const auth = authenticate(query, ws);
   if (!auth) return;
 
   const { session, role } = auth;
 
-  // ── 2. Auto-pair ──────────────────────────────────────────────────────────
   if (role === 'mobile' && session.status === 'pending') {
     store.pairSession(session.id);
     console.log(`[WS] Session ${session.id} auto-paired on mobile connect`);
   }
 
-  // ── 3. Register socket ────────────────────────────────────────────────────
   const socketId = registerSocket(ws, session.id, role);
   store.updateSessionSocket(session.id, role, socketId);
 
   const connectionCount = getConnectionCount(session.id);
 
-  // ── 4. Confirm to THIS client ─────────────────────────────────────────────
   send(ws, MSG.CONNECTED, {
     connection_type:  role,
     connection_count: connectionCount,
     sessionId:        session.id,
   });
 
-  // ── 5. Notify peer ────────────────────────────────────────────────────────
   const peer = getPeerSocket(session.id, role);
   if (peer) {
     send(peer, MSG.CONNECTED, {
@@ -192,21 +182,11 @@ function onConnection(ws, req) {
     `[WS] ${role} connected | session=${session.id} | socket=${socketId} | peers=${connectionCount}`
   );
 
-  // ── 6. Native pong ────────────────────────────────────────────────────────
-  ws.on('pong', () => {
-    ws._isAlive = true;
-  });
-
-  // ── 7. Message handler ────────────────────────────────────────────────────
   ws.on('message', (raw) => {
-    // KEY FIX (Bug 1): Mark this socket alive on ANY message.
-    // React Native does NOT auto-reply to native ws.ping() frames, so the
-    // native pong event never fires on mobile clients. Without this line,
-    // the server's heartbeat marks every React Native socket as dead after
-    // one missed native pong cycle and calls ws.terminate() → code 1006.
-    // By treating any received message as a keep-alive signal we ensure
-    // the heartbeat never falsely evicts a healthy React Native connection.
-    ws._isAlive = true;
+    // THE critical line — refresh the eviction timer on every received message.
+    // The mobile app sends { type:'ping' } every 20 s; this resets the 70 s
+    // timeout and keeps the connection alive without any native ping frames.
+    ws._lastMessageAt = Date.now();
 
     let data;
     try {
@@ -216,13 +196,11 @@ function onConnection(ws, req) {
       return;
     }
 
-    // ── Application ping ──────────────────────────────────────────────────
     if (data.type === MSG.PING) {
       send(ws, MSG.PONG, { ts: Date.now() });
       return;
     }
 
-    // ── Main relay ────────────────────────────────────────────────────────
     if (data.type === MSG.MESSAGE) {
       const peerWs = getPeerSocket(session.id, role);
       if (peerWs) {
@@ -233,33 +211,25 @@ function onConnection(ws, req) {
       return;
     }
 
-    // ── rituals_collection shortcut ───────────────────────────────────────
     if (data.type === MSG.RITUALS_COLLECTION && Array.isArray(data.payload)) {
       const peerWs = getPeerSocket(session.id, role);
-      if (peerWs) {
-        send(peerWs, MSG.RITUALS_COLLECTION, { payload: data.payload });
-      }
+      if (peerWs) send(peerWs, MSG.RITUALS_COLLECTION, { payload: data.payload });
       return;
     }
 
-    // ── TV reconnect signal ───────────────────────────────────────────────
     if (data.type === 'reconnected') {
       const peerWs = getPeerSocket(session.id, role);
-      if (peerWs) {
-        send(peerWs, 'reconnected', { role, sessionId: session.id });
-      }
+      if (peerWs) send(peerWs, 'reconnected', { role, sessionId: session.id });
       return;
     }
 
     console.warn(`[WS] Unhandled type "${data.type}" from ${role} | session=${session.id}`);
   });
 
-  // ── 8. Disconnect handler ─────────────────────────────────────────────────
-  ws.on('close', (code) => {
+  ws.on('close', (code, reason) => {
     console.log(
-      `[WS] ${role} disconnected | session=${session.id} | socket=${socketId} | code=${code}`
+      `[WS] ${role} disconnected | session=${session.id} | socket=${socketId} | code=${code} | reason=${reason?.toString()}`
     );
-
     unregisterSocket(socketId);
     store.clearSessionSocket(session.id, role);
 
@@ -288,7 +258,7 @@ function attachWebSocket(httpServer) {
   wss.on('connection', onConnection);
   wss.on('error', (err) => console.error('[WSS] Server error:', err.message));
 
-  console.log('[WSS] WebSocket server attached at /ws');
+  console.log('[WSS] WebSocket server attached at /ws — v3 (timestamp heartbeat, no native ping)');
   return wss;
 }
 
