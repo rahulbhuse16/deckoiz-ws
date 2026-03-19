@@ -7,26 +7,22 @@
  *   TV:     ws://host/ws?role=tv&sessionId=<id>
  *   Mobile: ws://host/ws?role=mobile&sessionId=<id>
  *
- *   That's it. No pairToken. No extra auth. Just sessionId.
+ * ─── KEY FIX: React Native heartbeat compatibility ────────────────────────────
+ *   React Native's WebSocket does NOT respond to native ws.ping() frames.
+ *   The old code used ONLY native pings, so every React Native client was
+ *   terminated after 2 heartbeat cycles (50 s) with code 1006.
  *
- * ─── Never-fail guarantee ─────────────────────────────────────────────────────
- *   Any client that supplies a sessionId will ALWAYS be allowed in.
- *   If the session doesn't exist (server restart, file missing, etc.)
- *   it is transparently recreated with the same ID.
- *   Clients never see SESSION_NOT_FOUND or SESSION_EXPIRED.
- *   The only way a session is gone is an explicit logout (deleteSession).
+ *   Fix: set ws._isAlive = true on ANY received message, not only on native
+ *   pong events. The mobile client sends { type: 'ping' } at the application
+ *   level every 20 s — this now keeps the server heartbeat satisfied.
  *
  * ─── Message contract (Mobile → Server → TV) ─────────────────────────────────
  *
  *   Mobile SENDS:
- *     { type: 'message', data: { type: 'artWork'|'collectionQueue'|'aiMagic'|..., payload: {...} } }
+ *     { type: 'message', data: { type: 'artWork'|'collectionQueue'|..., payload: {...} } }
  *
  *   TV RECEIVES:
  *     { type: 'message', data: { type: 'artWork', payload: {...} } }
- *
- *   TV reads:
- *     message.data.type    → 'artWork'
- *     message.data.payload → { image, title, ... }
  *
  * ─── Server → Client events ──────────────────────────────────────────────────
  *   connected   → { type: 'connected',  connection_type, connection_count, sessionId }
@@ -42,7 +38,10 @@ const store = require('./session.store');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const HEARTBEAT_INTERVAL = 25_000; // ms — native ping/pong cycle
+// Native ping/pong cycle. This guards TCP connections that are truly dead
+// (e.g. phone goes offline hard). We keep it generous because React Native
+// clients supplement with app-level pings (see onmessage handler).
+const HEARTBEAT_INTERVAL = 40_000; // ms — increased from 25 s
 
 // ─── Message type constants ───────────────────────────────────────────────────
 
@@ -113,16 +112,6 @@ function sendError(ws, message, code = 'ERROR') {
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
-/**
- * Authenticate an incoming connection.
- *
- * Rules:
- *  - role must be 'tv' or 'mobile'
- *  - sessionId must be present
- *  - session is ALWAYS resolved via getOrCreateSession —
- *    which returns the existing session or recreates it with the same ID.
- *  - This means SESSION_NOT_FOUND and SESSION_EXPIRED can never happen.
- */
 function authenticate(query, ws) {
   const { role, sessionId } = query;
 
@@ -136,9 +125,7 @@ function authenticate(query, ws) {
     return null;
   }
 
-  // getOrCreateSession: never returns null
-  // If session exists → return it and touch lastSeenAt
-  // If not found    → recreate transparently with the same sessionId
+  // getOrCreateSession: never returns null — recreates transparently if needed
   const session = store.getOrCreateSession(sessionId);
   return { session, role };
 }
@@ -154,7 +141,7 @@ function startHeartbeat(wss) {
         return;
       }
       ws._isAlive = false;
-      ws.ping(); // native WS ping → triggers 'pong' event on client side
+      ws.ping(); // native WS ping frame
     });
   }, HEARTBEAT_INTERVAL);
 
@@ -166,15 +153,13 @@ function startHeartbeat(wss) {
 function onConnection(ws, req) {
   const query = url.parse(req.url, true).query;
 
-  // ── 1. Auth — never fails for a valid sessionId ───────────────────────────
+  // ── 1. Auth ───────────────────────────────────────────────────────────────
   const auth = authenticate(query, ws);
-  if (!auth) return; // only fails if role/sessionId missing or invalid role
+  if (!auth) return;
 
   const { session, role } = auth;
 
-  // ── 2. Auto-pair when both sides have connected at least once ─────────────
-  //    We treat the first time mobile connects to a session as "pairing".
-  //    No token, no QR re-scan — just sessionId.
+  // ── 2. Auto-pair ──────────────────────────────────────────────────────────
   if (role === 'mobile' && session.status === 'pending') {
     store.pairSession(session.id);
     console.log(`[WS] Session ${session.id} auto-paired on mobile connect`);
@@ -187,26 +172,17 @@ function onConnection(ws, req) {
   const connectionCount = getConnectionCount(session.id);
 
   // ── 4. Confirm to THIS client ─────────────────────────────────────────────
-  //
-  // TV frontend reads:
-  //   data.connection_type   → own role ('tv' | 'mobile')
-  //   data.connection_count  → total devices online now (>1 = peer is here)
-  //
   send(ws, MSG.CONNECTED, {
     connection_type:  role,
     connection_count: connectionCount,
     sessionId:        session.id,
   });
 
-  // ── 5. Notify peer that this device joined ────────────────────────────────
-  //
-  // Peer gets 'connected' with connection_type = the role that JUST joined.
-  // TV uses this to set isMobileConnected = true when connection_type = 'mobile'.
-  //
+  // ── 5. Notify peer ────────────────────────────────────────────────────────
   const peer = getPeerSocket(session.id, role);
   if (peer) {
     send(peer, MSG.CONNECTED, {
-      connection_type:  role,            // who just joined
+      connection_type:  role,
       connection_count: connectionCount,
       sessionId:        session.id,
     });
@@ -223,6 +199,15 @@ function onConnection(ws, req) {
 
   // ── 7. Message handler ────────────────────────────────────────────────────
   ws.on('message', (raw) => {
+    // KEY FIX (Bug 1): Mark this socket alive on ANY message.
+    // React Native does NOT auto-reply to native ws.ping() frames, so the
+    // native pong event never fires on mobile clients. Without this line,
+    // the server's heartbeat marks every React Native socket as dead after
+    // one missed native pong cycle and calls ws.terminate() → code 1006.
+    // By treating any received message as a keep-alive signal we ensure
+    // the heartbeat never falsely evicts a healthy React Native connection.
+    ws._isAlive = true;
+
     let data;
     try {
       data = JSON.parse(raw);
@@ -233,39 +218,22 @@ function onConnection(ws, req) {
 
     // ── Application ping ──────────────────────────────────────────────────
     if (data.type === MSG.PING) {
-      ws._isAlive = true;
       send(ws, MSG.PONG, { ts: Date.now() });
       return;
     }
 
     // ── Main relay ────────────────────────────────────────────────────────
-    //
-    // Mobile sends:  { type: 'message', data: { type: 'artWork', payload: {...} } }
-    //                                   ^--- key is 'data'
-    // Server relays: { type: 'message', data: { type: 'artWork', payload: {...} } }
-    //
-    // TV reads:
-    //   message.data.type    → 'artWork'
-    //   message.data.payload → { image, ... }
-    //
     if (data.type === MSG.MESSAGE) {
       const peerWs = getPeerSocket(session.id, role);
       if (peerWs) {
-        send(peerWs, MSG.MESSAGE, {
-          data: data.data ?? null, // forward data.data — NOT data.payload
-        });
+        send(peerWs, MSG.MESSAGE, { data: data.data ?? null });
       } else {
-        // Silently ignore if peer is offline — it will catch up on reconnect
         console.log(`[WS] Peer offline for session ${session.id} — message dropped`);
       }
       return;
     }
 
     // ── rituals_collection shortcut ───────────────────────────────────────
-    //
-    // Mobile sends: { type: 'rituals_collection', payload: [...] }
-    // Forwarded as-is. TV frontend reads data.type === 'rituals_collection'.
-    //
     if (data.type === MSG.RITUALS_COLLECTION && Array.isArray(data.payload)) {
       const peerWs = getPeerSocket(session.id, role);
       if (peerWs) {
@@ -275,10 +243,6 @@ function onConnection(ws, req) {
     }
 
     // ── TV reconnect signal ───────────────────────────────────────────────
-    //
-    // TV sends { type: 'reconnected' } after its WS reconnects.
-    // Forwarded to mobile so it knows TV is back online.
-    //
     if (data.type === 'reconnected') {
       const peerWs = getPeerSocket(session.id, role);
       if (peerWs) {
@@ -299,7 +263,6 @@ function onConnection(ws, req) {
     unregisterSocket(socketId);
     store.clearSessionSocket(session.id, role);
 
-    // Notify peer — TV frontend listens for type='disconnect', connection_type='mobile'
     const peerWs = getPeerSocket(session.id, role);
     if (peerWs) {
       send(peerWs, MSG.DISCONNECT, {
@@ -317,18 +280,6 @@ function onConnection(ws, req) {
 
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
-/**
- * Attach a WebSocket server to an existing HTTP/HTTPS server.
- *
- * Usage:
- *   const http = require('http');
- *   const app  = require('./app');
- *   const attachWebSocket = require('./websocket');
- *
- *   const server = http.createServer(app);
- *   attachWebSocket(server);
- *   server.listen(3000);
- */
 function attachWebSocket(httpServer) {
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
