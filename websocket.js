@@ -3,32 +3,49 @@
  *
  * Persistent WebSocket server for TV ↔ Mobile communication.
  *
- * ─── KEY FIX: React Native does NOT respond to native ws.ping() frames ─────
- *   The ws library's built-in heartbeat sends native WebSocket ping frames
- *   and calls ws.terminate() if no native pong comes back. React Native's
- *   WebSocket implementation silently drops native ping frames — it never
- *   sends a native pong. Result: every RN client gets terminated after
- *   one heartbeat cycle with code 1006.
+ * ─── Connection URLs ──────────────────────────────────────────────────────────
+ *   TV:     ws://host/ws?role=tv&sessionId=<id>
+ *   Mobile: ws://host/ws?role=mobile&sessionId=<id>
  *
- *   Solution: remove native ws.ping() entirely. Instead, track the timestamp
- *   of the last received message on each socket. If no message arrives within
- *   SOCKET_TIMEOUT, close gracefully with ws.close() (not ws.terminate()).
- *   The mobile client sends { type: 'ping' } every 20 s, which is enough.
+ *   That's it. No pairToken. No extra auth. Just sessionId.
+ *
+ * ─── Never-fail guarantee ─────────────────────────────────────────────────────
+ *   Any client that supplies a sessionId will ALWAYS be allowed in.
+ *   If the session doesn't exist (server restart, file missing, etc.)
+ *   it is transparently recreated with the same ID.
+ *   Clients never see SESSION_NOT_FOUND or SESSION_EXPIRED.
+ *   The only way a session is gone is an explicit logout (deleteSession).
+ *
+ * ─── Message contract (Mobile → Server → TV) ─────────────────────────────────
+ *
+ *   Mobile SENDS:
+ *     { type: 'message', data: { type: 'artWork'|'collectionQueue'|'aiMagic'|..., payload: {...} } }
+ *
+ *   TV RECEIVES:
+ *     { type: 'message', data: { type: 'artWork', payload: {...} } }
+ *
+ *   TV reads:
+ *     message.data.type    → 'artWork'
+ *     message.data.payload → { image, title, ... }
+ *
+ * ─── Server → Client events ──────────────────────────────────────────────────
+ *   connected   → { type: 'connected',  connection_type, connection_count, sessionId }
+ *   disconnect  → { type: 'disconnect', connection_type, sessionId, message }
+ *   message     → { type: 'message',    data: { type, payload } }
+ *   pong        → { type: 'pong',       ts }
+ *   error       → { type: 'error',      code, message }
  */
-
+ 
 const { WebSocketServer, WebSocket } = require('ws');
 const url   = require('url');
 const store = require('./session.store');
-
+ 
 // ─── Config ───────────────────────────────────────────────────────────────────
-
-const HEARTBEAT_CHECK_INTERVAL = 20_000;  // how often we scan sockets (ms)
-const SOCKET_TIMEOUT           = 70_000;  // evict if silent for this long (ms)
-                                           // mobile pings every 20 s →
-                                           // 70 s = 3 missed pings before eviction
-
+ 
+const HEARTBEAT_INTERVAL = 25_000; // ms — native ping/pong cycle
+ 
 // ─── Message type constants ───────────────────────────────────────────────────
-
+ 
 const MSG = {
   CONNECTED:          'connected',
   DISCONNECT:         'disconnect',
@@ -38,26 +55,26 @@ const MSG = {
   PING:               'ping',
   ERROR:              'error',
 };
-
+ 
 // ─── Socket registry ──────────────────────────────────────────────────────────
-
+ 
 let _socketCounter = 0;
-const socketMap    = new Map();
-
+const socketMap    = new Map(); // socketId → { ws, sessionId, role }
+ 
 function registerSocket(ws, sessionId, role) {
-  const socketId      = `${role}-${++_socketCounter}`;
-  ws._socketId        = socketId;
-  ws._sessionId       = sessionId;
-  ws._role            = role;
-  ws._lastMessageAt   = Date.now();
+  const socketId    = `${role}-${++_socketCounter}`;
+  ws._socketId      = socketId;
+  ws._sessionId     = sessionId;
+  ws._role          = role;
+  ws._isAlive       = true;
   socketMap.set(socketId, { ws, sessionId, role });
   return socketId;
 }
-
+ 
 function unregisterSocket(socketId) {
   socketMap.delete(socketId);
 }
-
+ 
 function getSessionSockets(sessionId, role = null) {
   const results = [];
   for (const entry of socketMap.values()) {
@@ -71,123 +88,141 @@ function getSessionSockets(sessionId, role = null) {
   }
   return results;
 }
-
+ 
 function getPeerSocket(sessionId, ownRole) {
   const peerRole = ownRole === 'tv' ? 'mobile' : 'tv';
   const peers    = getSessionSockets(sessionId, peerRole);
   return peers.length ? peers[0].ws : null;
 }
-
+ 
 function getConnectionCount(sessionId) {
   return getSessionSockets(sessionId).length;
 }
-
+ 
 // ─── Send helpers ─────────────────────────────────────────────────────────────
-
+ 
 function send(ws, type, extra = {}) {
   if (ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type, ...extra }));
 }
-
+ 
 function sendError(ws, message, code = 'ERROR') {
   send(ws, MSG.ERROR, { code, message });
   ws.close(4000, message);
 }
-
+ 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-
+ 
+/**
+ * Authenticate an incoming connection.
+ *
+ * Rules:
+ *  - role must be 'tv' or 'mobile'
+ *  - sessionId must be present
+ *  - session is ALWAYS resolved via getOrCreateSession —
+ *    which returns the existing session or recreates it with the same ID.
+ *  - This means SESSION_NOT_FOUND and SESSION_EXPIRED can never happen.
+ */
 function authenticate(query, ws) {
   const { role, sessionId } = query;
-
+ 
   if (!role || !sessionId) {
     sendError(ws, 'role and sessionId are required', 'MISSING_PARAMS');
     return null;
   }
-
+ 
   if (role !== 'tv' && role !== 'mobile') {
     sendError(ws, 'role must be "tv" or "mobile"', 'INVALID_ROLE');
     return null;
   }
-
+ 
+  // getOrCreateSession: never returns null
+  // If session exists → return it and touch lastSeenAt
+  // If not found    → recreate transparently with the same sessionId
   const session = store.getOrCreateSession(sessionId);
   return { session, role };
 }
-
-// ─── Heartbeat (timestamp-based — NO native ws.ping()) ───────────────────────
-//
-// React Native WebSocket does NOT reply to native WS ping frames, so using
-// ws.ping() + ws.terminate() on missed pong will always kill RN clients.
-//
-// Instead: every HEARTBEAT_CHECK_INTERVAL ms, iterate all open sockets and
-// check how long since the last message. Exceeds SOCKET_TIMEOUT → close
-// gracefully with ws.close() so the client receives a proper close frame
-// (code 1001) and can reconnect cleanly — not the abrupt terminate() that
-// produces code 1006.
-//
+ 
+// ─── Heartbeat ────────────────────────────────────────────────────────────────
+ 
 function startHeartbeat(wss) {
   const interval = setInterval(() => {
-    const now = Date.now();
     wss.clients.forEach((ws) => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-
-      const silentMs = now - (ws._lastMessageAt || now);
-      if (silentMs > SOCKET_TIMEOUT) {
-        console.log(
-          `[WS] No message from ${ws._socketId} for ${Math.round(silentMs / 1000)}s — closing`
-        );
-        ws.close(1001, 'heartbeat timeout');
+      if (!ws._isAlive) {
+        console.log(`[WS] Terminating unresponsive socket: ${ws._socketId}`);
+        ws.terminate();
+        return;
       }
+      ws._isAlive = false;
+      ws.ping(); // native WS ping → triggers 'pong' event on client side
     });
-  }, HEARTBEAT_CHECK_INTERVAL);
-
+  }, HEARTBEAT_INTERVAL);
+ 
   wss.on('close', () => clearInterval(interval));
 }
-
+ 
 // ─── Connection handler ───────────────────────────────────────────────────────
-
+ 
 function onConnection(ws, req) {
   const query = url.parse(req.url, true).query;
-
+ 
+  // ── 1. Auth — never fails for a valid sessionId ───────────────────────────
   const auth = authenticate(query, ws);
-  if (!auth) return;
-
+  if (!auth) return; // only fails if role/sessionId missing or invalid role
+ 
   const { session, role } = auth;
-
+ 
+  // ── 2. Auto-pair when both sides have connected at least once ─────────────
+  //    We treat the first time mobile connects to a session as "pairing".
+  //    No token, no QR re-scan — just sessionId.
   if (role === 'mobile' && session.status === 'pending') {
     store.pairSession(session.id);
     console.log(`[WS] Session ${session.id} auto-paired on mobile connect`);
   }
-
+ 
+  // ── 3. Register socket ────────────────────────────────────────────────────
   const socketId = registerSocket(ws, session.id, role);
   store.updateSessionSocket(session.id, role, socketId);
-
+ 
   const connectionCount = getConnectionCount(session.id);
-
+ 
+  // ── 4. Confirm to THIS client ─────────────────────────────────────────────
+  //
+  // TV frontend reads:
+  //   data.connection_type   → own role ('tv' | 'mobile')
+  //   data.connection_count  → total devices online now (>1 = peer is here)
+  //
   send(ws, MSG.CONNECTED, {
     connection_type:  role,
     connection_count: connectionCount,
     sessionId:        session.id,
   });
-
+ 
+  // ── 5. Notify peer that this device joined ────────────────────────────────
+  //
+  // Peer gets 'connected' with connection_type = the role that JUST joined.
+  // TV uses this to set isMobileConnected = true when connection_type = 'mobile'.
+  //
   const peer = getPeerSocket(session.id, role);
   if (peer) {
     send(peer, MSG.CONNECTED, {
-      connection_type:  role,
+      connection_type:  role,            // who just joined
       connection_count: connectionCount,
       sessionId:        session.id,
     });
   }
-
+ 
   console.log(
     `[WS] ${role} connected | session=${session.id} | socket=${socketId} | peers=${connectionCount}`
   );
-
+ 
+  // ── 6. Native pong ────────────────────────────────────────────────────────
+  ws.on('pong', () => {
+    ws._isAlive = true;
+  });
+ 
+  // ── 7. Message handler ────────────────────────────────────────────────────
   ws.on('message', (raw) => {
-    // THE critical line — refresh the eviction timer on every received message.
-    // The mobile app sends { type:'ping' } every 20 s; this resets the 70 s
-    // timeout and keeps the connection alive without any native ping frames.
-    ws._lastMessageAt = Date.now();
-
     let data;
     try {
       data = JSON.parse(raw);
@@ -195,44 +230,76 @@ function onConnection(ws, req) {
       send(ws, MSG.ERROR, { code: 'INVALID_JSON', message: 'Message must be valid JSON' });
       return;
     }
-
+ 
+    // ── Application ping ──────────────────────────────────────────────────
     if (data.type === MSG.PING) {
+      ws._isAlive = true;
       send(ws, MSG.PONG, { ts: Date.now() });
       return;
     }
-
+ 
+    // ── Main relay ────────────────────────────────────────────────────────
+    //
+    // Mobile sends:  { type: 'message', data: { type: 'artWork', payload: {...} } }
+    //                                   ^--- key is 'data'
+    // Server relays: { type: 'message', data: { type: 'artWork', payload: {...} } }
+    //
+    // TV reads:
+    //   message.data.type    → 'artWork'
+    //   message.data.payload → { image, ... }
+    //
     if (data.type === MSG.MESSAGE) {
       const peerWs = getPeerSocket(session.id, role);
       if (peerWs) {
-        send(peerWs, MSG.MESSAGE, { data: data.data ?? null });
+        send(peerWs, MSG.MESSAGE, {
+          data: data.data ?? null, // forward data.data — NOT data.payload
+        });
       } else {
+        // Silently ignore if peer is offline — it will catch up on reconnect
         console.log(`[WS] Peer offline for session ${session.id} — message dropped`);
       }
       return;
     }
-
+ 
+    // ── rituals_collection shortcut ───────────────────────────────────────
+    //
+    // Mobile sends: { type: 'rituals_collection', payload: [...] }
+    // Forwarded as-is. TV frontend reads data.type === 'rituals_collection'.
+    //
     if (data.type === MSG.RITUALS_COLLECTION && Array.isArray(data.payload)) {
       const peerWs = getPeerSocket(session.id, role);
-      if (peerWs) send(peerWs, MSG.RITUALS_COLLECTION, { payload: data.payload });
+      if (peerWs) {
+        send(peerWs, MSG.RITUALS_COLLECTION, { payload: data.payload });
+      }
       return;
     }
-
+ 
+    // ── TV reconnect signal ───────────────────────────────────────────────
+    //
+    // TV sends { type: 'reconnected' } after its WS reconnects.
+    // Forwarded to mobile so it knows TV is back online.
+    //
     if (data.type === 'reconnected') {
       const peerWs = getPeerSocket(session.id, role);
-      if (peerWs) send(peerWs, 'reconnected', { role, sessionId: session.id });
+      if (peerWs) {
+        send(peerWs, 'reconnected', { role, sessionId: session.id });
+      }
       return;
     }
-
+ 
     console.warn(`[WS] Unhandled type "${data.type}" from ${role} | session=${session.id}`);
   });
-
-  ws.on('close', (code, reason) => {
+ 
+  // ── 8. Disconnect handler ─────────────────────────────────────────────────
+  ws.on('close', (code) => {
     console.log(
-      `[WS] ${role} disconnected | session=${session.id} | socket=${socketId} | code=${code} | reason=${reason?.toString()}`
+      `[WS] ${role} disconnected | session=${session.id} | socket=${socketId} | code=${code}`
     );
+ 
     unregisterSocket(socketId);
     store.clearSessionSocket(session.id, role);
-
+ 
+    // Notify peer — TV frontend listens for type='disconnect', connection_type='mobile'
     const peerWs = getPeerSocket(session.id, role);
     if (peerWs) {
       send(peerWs, MSG.DISCONNECT, {
@@ -242,24 +309,36 @@ function onConnection(ws, req) {
       });
     }
   });
-
+ 
   ws.on('error', (err) => {
     console.error(`[WS] Error | session=${session.id} | socket=${socketId} | ${err.message}`);
   });
 }
-
+ 
 // ─── Factory ──────────────────────────────────────────────────────────────────
-
+ 
+/**
+ * Attach a WebSocket server to an existing HTTP/HTTPS server.
+ *
+ * Usage:
+ *   const http = require('http');
+ *   const app  = require('./app');
+ *   const attachWebSocket = require('./websocket');
+ *
+ *   const server = http.createServer(app);
+ *   attachWebSocket(server);
+ *   server.listen(3000);
+ */
 function attachWebSocket(httpServer) {
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
-
+ 
   startHeartbeat(wss);
-
+ 
   wss.on('connection', onConnection);
   wss.on('error', (err) => console.error('[WSS] Server error:', err.message));
-
-  console.log('[WSS] WebSocket server attached at /ws — v3 (timestamp heartbeat, no native ping)');
+ 
+  console.log('[WSS] WebSocket server attached at /ws');
   return wss;
 }
-
+ 
 module.exports = attachWebSocket;
